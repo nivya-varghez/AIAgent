@@ -1,4 +1,5 @@
 name: Deploy Application
+run-name: Deploy ${{ inputs.app_name || github.event.inputs.app_name }}:${{ inputs.version || github.event.inputs.version }} to ${{ inputs.environment || github.event.inputs.environment }} by @${{ github.actor }}
 
 on:
   workflow_dispatch:
@@ -73,65 +74,6 @@ on:
         type: string
       source_path:
         description: Checkout folder name for source repository
-        required: false
-        default: app-source
-        type: string
-  workflow_call:
-    inputs:
-      app_name:
-        required: true
-        type: string
-      environment:
-        required: true
-        type: string
-      image_repository:
-        required: false
-        default: ''
-        type: string
-      version:
-        required: true
-        type: string
-      container_port:
-        required: false
-        default: '8080'
-        type: string
-      reason:
-        required: false
-        default: ''
-        type: string
-      deploy_command:
-        required: false
-        default: ''
-        type: string
-      build_context:
-        required: false
-        default: sample-app
-        type: string
-      dockerfile_path:
-        required: false
-        default: sample-app/Dockerfile
-        type: string
-      k8s_namespace:
-        required: false
-        default: ''
-        type: string
-      deployment_name:
-        required: false
-        default: ''
-        type: string
-      container_name:
-        required: false
-        default: ''
-        type: string
-      source_repository:
-        required: false
-        default: ''
-        type: string
-      source_ref:
-        required: false
-        default: main
-        type: string
-      source_path:
         required: false
         default: app-source
         type: string

@@ -1,4 +1,5 @@
 name: Rollback Deployment
+run-name: Rollback ${{ inputs.app_name || github.event.inputs.app_name }} in ${{ inputs.environment || github.event.inputs.environment }} by @${{ github.actor }}
 
 on:
   workflow_dispatch:
@@ -32,9 +33,9 @@ on:
         default: ''
         type: string
       rollback_mode:
-        description: Rollback mode: undo or set_image
+        description: Rollback mode->undo or set_image
         required: false
-        default: undo
+        default: "undo"
         type: string
       k8s_namespace:
         description: Kubernetes namespace (defaults to environment)
