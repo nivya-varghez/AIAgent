@@ -51,46 +51,6 @@ on:
         required: false
         default: ''
         type: string
-  workflow_call:
-    inputs:
-      app_name:
-        required: true
-        type: string
-      environment:
-        required: true
-        type: string
-      image_repository:
-        required: false
-        default: ''
-        type: string
-      previous_version:
-        required: false
-        default: ''
-        type: string
-      incident_reference:
-        required: false
-        default: ''
-        type: string
-      rollback_command:
-        required: false
-        default: ''
-        type: string
-      rollback_mode:
-        required: false
-        default: undo
-        type: string
-      k8s_namespace:
-        required: false
-        default: ''
-        type: string
-      deployment_name:
-        required: false
-        default: ''
-        type: string
-      container_name:
-        required: false
-        default: ''
-        type: string
 
 permissions:
   contents: read
