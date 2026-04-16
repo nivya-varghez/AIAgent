@@ -127,6 +127,7 @@ jobs:
           if [ -z "$value" ]; then
             value="ghcr.io/${{ github.repository_owner }}/$APP_NAME"
           fi
+          value="$(echo "$value" | tr '[:upper:]' '[:lower:]')"
           echo "value=$value" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -143,8 +144,8 @@ jobs:
       - name: Build image
         uses: docker/build-push-action@v6
         with:
-          context: ${{ env.BUILD_CONTEXT }}
-          file: ${{ env.DOCKERFILE_PATH }}
+          context: ${{ steps.build_paths.outputs.context }}
+          file: ${{ steps.build_paths.outputs.dockerfile }}
           tags: ${{ steps.image.outputs.value }}:${{ env.VERSION }}
           push: ${{ env.PUSH_IMAGE == 'true' }}
           load: ${{ env.PUSH_IMAGE != 'true' }}
@@ -174,7 +175,7 @@ jobs:
 
       - name: Show deployment command summary
         run: |
-          echo "docker build -f $DOCKERFILE_PATH -t ${{ steps.image.outputs.value }}:$VERSION $BUILD_CONTEXT"
+          echo "docker build -f ${{ steps.build_paths.outputs.dockerfile }} -t ${{ steps.image.outputs.value }}:$VERSION ${{ steps.build_paths.outputs.context }}"
           echo "docker push ${{ steps.image.outputs.value }}:$VERSION (if push_image=true)"
           echo "docker pull ${{ steps.image.outputs.value }}:$VERSION"
           echo "docker run -d --name $APP_NAME -p $CONTAINER_PORT:$CONTAINER_PORT ${{ steps.image.outputs.value }}:$VERSION"

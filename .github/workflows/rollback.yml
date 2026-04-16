@@ -95,6 +95,7 @@ jobs:
           if [ -z "$value" ]; then
             value="ghcr.io/${{ github.repository_owner }}/$APP_NAME"
           fi
+          value="$(echo "$value" | tr '[:upper:]' '[:lower:]')"
           echo "value=$value" >> "$GITHUB_OUTPUT"
 
       - name: Capture rollback request
