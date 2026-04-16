@@ -81,7 +81,6 @@ subparsers = parser.add_subparsers(dest="operation", required=True)
 
 common = argparse.ArgumentParser(add_help=False)
 common.add_argument("--app-name", required=True)
-common.add_argument("--environment", required=False)
 common.add_argument("--image-repository", required=True)
 common.add_argument("--requested-by", required=True)
 
