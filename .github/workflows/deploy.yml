@@ -47,9 +47,24 @@ on:
         default: sample-app/Dockerfile
         type: string
       push_image:
-        description: Push image to repository (true/false)
+        description: Push image to repository (kept for compatibility, ignored)
         required: false
-        default: 'false'
+        default: 'true'
+        type: string
+      k8s_namespace:
+        description: Kubernetes namespace (defaults to environment)
+        required: false
+        default: ''
+        type: string
+      deployment_name:
+        description: Kubernetes deployment name (defaults to app_name)
+        required: false
+        default: ''
+        type: string
+      container_name:
+        description: Container name in deployment (defaults to app_name)
+        required: false
+        default: ''
         type: string
       source_repository:
         description: Optional source repo containing Dockerfile/app (owner/repo)
@@ -103,7 +118,19 @@ on:
         type: string
       push_image:
         required: false
-        default: 'false'
+        default: 'true'
+        type: string
+      k8s_namespace:
+        required: false
+        default: ''
+        type: string
+      deployment_name:
+        required: false
+        default: ''
+        type: string
+      container_name:
+        required: false
+        default: ''
         type: string
       source_repository:
         required: false
@@ -136,10 +163,15 @@ jobs:
       DEPLOY_COMMAND: ${{ inputs.deploy_command || github.event.inputs.deploy_command }}
       BUILD_CONTEXT: ${{ inputs.build_context || github.event.inputs.build_context }}
       DOCKERFILE_PATH: ${{ inputs.dockerfile_path || github.event.inputs.dockerfile_path }}
-      PUSH_IMAGE: ${{ inputs.push_image || github.event.inputs.push_image }}
+      K8S_NAMESPACE_INPUT: ${{ inputs.k8s_namespace || github.event.inputs.k8s_namespace }}
+      DEPLOYMENT_NAME_INPUT: ${{ inputs.deployment_name || github.event.inputs.deployment_name }}
+      CONTAINER_NAME_INPUT: ${{ inputs.container_name || github.event.inputs.container_name }}
       SOURCE_REPOSITORY: ${{ inputs.source_repository || github.event.inputs.source_repository }}
       SOURCE_REF: ${{ inputs.source_ref || github.event.inputs.source_ref }}
       SOURCE_PATH: ${{ inputs.source_path || github.event.inputs.source_path }}
+      ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+      AKS_CLUSTER_NAME: ${{ secrets.AKS_CLUSTER_NAME }}
+      AKS_RESOURCE_GROUP: ${{ secrets.AKS_RESOURCE_GROUP }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -158,13 +190,49 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Resolve Kubernetes target
+        id: k8s
+        shell: bash
+        run: |
+          namespace="$K8S_NAMESPACE_INPUT"
+          if [ -z "$namespace" ]; then
+            namespace="$(echo "$ENVIRONMENT" | tr '[:upper:]' '[:lower:]')"
+            if [ "$namespace" = "production" ]; then
+              namespace="prod"
+            fi
+          fi
+
+          deployment_name="$DEPLOYMENT_NAME_INPUT"
+          if [ -z "$deployment_name" ]; then
+            deployment_name="$APP_NAME"
+          fi
+
+          container_name="$CONTAINER_NAME_INPUT"
+          if [ -z "$container_name" ]; then
+            container_name="$APP_NAME"
+          fi
+
+          echo "namespace=$namespace" >> "$GITHUB_OUTPUT"
+          echo "deployment_name=$deployment_name" >> "$GITHUB_OUTPUT"
+          echo "container_name=$container_name" >> "$GITHUB_OUTPUT"
+
       - name: Resolve image repository
         id: image
         shell: bash
         run: |
           value="${{ inputs.image_repository || github.event.inputs.image_repository }}"
           if [ -z "$value" ]; then
-            value="ghcr.io/${{ github.repository_owner }}/$APP_NAME"
+            if [ -z "$ACR_LOGIN_SERVER" ]; then
+              echo "Missing required secret ACR_LOGIN_SERVER"
+              exit 1
+            fi
+            value="$ACR_LOGIN_SERVER/$APP_NAME"
+          elif [[ "$value" != */* ]]; then
+            if [ -z "$ACR_LOGIN_SERVER" ]; then
+              echo "ACR_LOGIN_SERVER secret is required when image_repository has no registry"
+              exit 1
+            fi
+            value="$ACR_LOGIN_SERVER/$value"
           fi
           value="$(echo "$value" | tr '[:upper:]' '[:lower:]')"
           echo "value=$value" >> "$GITHUB_OUTPUT"
@@ -215,22 +283,40 @@ jobs:
           echo "Resolved build context: $context"
           echo "Resolved Dockerfile: $dockerfile"
 
-      - name: Log in to GHCR
-        if: env.PUSH_IMAGE == 'true' && startsWith(steps.image.outputs.value, 'ghcr.io/')
-        uses: docker/login-action@v3
+      - name: Azure login
+        uses: azure/login@v2
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Build image
+      - name: Login to Azure Container Registry
+        shell: bash
+        run: |
+          if [ -z "$ACR_LOGIN_SERVER" ]; then
+            echo "Missing required secret ACR_LOGIN_SERVER"
+            exit 1
+          fi
+          az acr login --name "${ACR_LOGIN_SERVER%%.*}"
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Get AKS credentials
+        shell: bash
+        run: |
+          if [ -z "$AKS_CLUSTER_NAME" ] || [ -z "$AKS_RESOURCE_GROUP" ]; then
+            echo "Missing required AKS_CLUSTER_NAME or AKS_RESOURCE_GROUP secret"
+            exit 1
+          fi
+          az aks get-credentials --resource-group "$AKS_RESOURCE_GROUP" --name "$AKS_CLUSTER_NAME" --overwrite-existing
+
+      - name: Build and push image to ACR
         uses: docker/build-push-action@v6
         with:
           context: ${{ steps.build_paths.outputs.context }}
           file: ${{ steps.build_paths.outputs.dockerfile }}
           tags: ${{ steps.image.outputs.value }}:${{ env.VERSION }}
-          push: ${{ env.PUSH_IMAGE == 'true' }}
-          load: ${{ env.PUSH_IMAGE != 'true' }}
+          push: true
+          load: false
 
       - name: Capture deployment request
         run: |
@@ -248,20 +334,370 @@ jobs:
         if: env.DEPLOY_COMMAND == ''
         shell: bash
         run: |
-          if [ "$PUSH_IMAGE" = "true" ]; then
-            docker pull "${{ steps.image.outputs.value }}:$VERSION"
-          fi
-          docker rm -f "$APP_NAME" >/dev/null 2>&1 || true
-          docker run -d --name "$APP_NAME" -p "$CONTAINER_PORT:$CONTAINER_PORT" "${{ steps.image.outputs.value }}:$VERSION"
-          docker ps --filter "name=$APP_NAME"
+          image="${{ steps.image.outputs.value }}:$VERSION"
+          kubectl set image deployment/${{ steps.k8s.outputs.deployment_name }} \
+            ${{ steps.k8s.outputs.container_name }}="$image" \
+            -n "${{ steps.k8s.outputs.namespace }}"
+          kubectl rollout status deployment/${{ steps.k8s.outputs.deployment_name }} \
+            -n "${{ steps.k8s.outputs.namespace }}" \
+            --timeout=180s
 
       - name: Show deployment command summary
         run: |
           echo "Source repository: ${{ steps.build_paths.outputs.source_repository }}"
           echo "docker build -f ${{ steps.build_paths.outputs.dockerfile }} -t ${{ steps.image.outputs.value }}:$VERSION ${{ steps.build_paths.outputs.context }}"
-          echo "docker push ${{ steps.image.outputs.value }}:$VERSION (if push_image=true)"
-          echo "docker pull ${{ steps.image.outputs.value }}:$VERSION"
-          echo "docker run -d --name $APP_NAME -p $CONTAINER_PORT:$CONTAINER_PORT ${{ steps.image.outputs.value }}:$VERSION"
+          echo "docker push ${{ steps.image.outputs.value }}:$VERSION"
+          echo "kubectl set image deployment/${{ steps.k8s.outputs.deployment_name }} ${{ steps.k8s.outputs.container_name }}=${{ steps.image.outputs.value }}:$VERSION -n ${{ steps.k8s.outputs.namespace }}"
+          echo "kubectl rollout status deployment/${{ steps.k8s.outputs.deployment_name }} -n ${{ steps.k8s.outputs.namespace }} --timeout=180s"
+
+      - name: Run custom deploy command
+        if: env.DEPLOY_COMMAND != ''
+        shell: bash
+        run: |
+          eval "$DEPLOY_COMMAND"
+
+      - name: Upload deployment manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}
+          path: deployment_state/*.json
+name: Deploy Application
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: Application identifier
+        required: true
+        type: string
+      environment:
+        description: Target environment
+        required: true
+        type: string
+      image_repository:
+        description: Container image repository (defaults to <ACR_LOGIN_SERVER>/<app_name>)
+        required: false
+        default: ''
+        type: string
+      version:
+        description: Image tag or release version
+        required: true
+        default: latest
+        type: string
+      container_port:
+        description: Application container port
+        required: true
+        default: '8080'
+        type: string
+      reason:
+        description: Deployment reason
+        required: false
+        default: ''
+        type: string
+      deploy_command:
+        description: Optional custom deployment command (overrides default kubectl/helm deploy)
+        required: false
+        default: ''
+        type: string
+      build_context:
+        description: Docker build context path
+        required: false
+        default: sample-app
+        type: string
+      dockerfile_path:
+        description: Dockerfile path
+        required: false
+        default: sample-app/Dockerfile
+        type: string
+      push_image:
+        description: Push image to ACR (true/false)
+        required: false
+        default: 'true'
+        type: string
+      source_repository:
+        description: Optional source repo containing Dockerfile/app (owner/repo)
+        required: false
+        default: ''
+        type: string
+      source_ref:
+        description: Branch or tag for source repository checkout
+        required: false
+        default: main
+        type: string
+      source_path:
+        description: Checkout folder name for source repository
+        required: false
+        default: app-source
+        type: string
+      aks_namespace:
+        description: Kubernetes namespace (defaults to environment)
+        required: false
+        default: ''
+        type: string
+      use_helm:
+        description: Use helm upgrade instead of kubectl set image (true/false)
+        required: false
+        default: 'false'
+        type: string
+      helm_release:
+        description: Helm release name (required when use_helm=true)
+        required: false
+        default: ''
+        type: string
+      helm_chart:
+        description: Helm chart path/reference (required when use_helm=true)
+        required: false
+        default: ''
+        type: string
+  workflow_call:
+    inputs:
+      app_name:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      image_repository:
+        required: false
+        default: ''
+        type: string
+      version:
+        required: true
+        type: string
+      container_port:
+        required: false
+        default: '8080'
+        type: string
+      reason:
+        required: false
+        default: ''
+        type: string
+      deploy_command:
+        required: false
+        default: ''
+        type: string
+      build_context:
+        required: false
+        default: sample-app
+        type: string
+      dockerfile_path:
+        required: false
+        default: sample-app/Dockerfile
+        type: string
+      push_image:
+        required: false
+        default: 'true'
+        type: string
+      source_repository:
+        required: false
+        default: ''
+        type: string
+      source_ref:
+        required: false
+        default: main
+        type: string
+      source_path:
+        required: false
+        default: app-source
+        type: string
+      aks_namespace:
+        required: false
+        default: ''
+        type: string
+      use_helm:
+        required: false
+        default: 'false'
+        type: string
+      helm_release:
+        required: false
+        default: ''
+        type: string
+      helm_chart:
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || github.event.inputs.environment }}
+    env:
+      APP_NAME: ${{ inputs.app_name || github.event.inputs.app_name }}
+      ENVIRONMENT: ${{ inputs.environment || github.event.inputs.environment }}
+      VERSION: ${{ inputs.version || github.event.inputs.version }}
+      CONTAINER_PORT: ${{ inputs.container_port || github.event.inputs.container_port }}
+      RELEASE_REASON: ${{ inputs.reason || github.event.inputs.reason }}
+      DEPLOY_COMMAND: ${{ inputs.deploy_command || github.event.inputs.deploy_command }}
+      BUILD_CONTEXT: ${{ inputs.build_context || github.event.inputs.build_context }}
+      DOCKERFILE_PATH: ${{ inputs.dockerfile_path || github.event.inputs.dockerfile_path }}
+      PUSH_IMAGE: ${{ inputs.push_image || github.event.inputs.push_image }}
+      SOURCE_REPOSITORY: ${{ inputs.source_repository || github.event.inputs.source_repository }}
+      SOURCE_REF: ${{ inputs.source_ref || github.event.inputs.source_ref }}
+      SOURCE_PATH: ${{ inputs.source_path || github.event.inputs.source_path }}
+      AKS_NAMESPACE: ${{ inputs.aks_namespace || github.event.inputs.aks_namespace }}
+      USE_HELM: ${{ inputs.use_helm || github.event.inputs.use_helm }}
+      HELM_RELEASE: ${{ inputs.helm_release || github.event.inputs.helm_release }}
+      HELM_CHART: ${{ inputs.helm_chart || github.event.inputs.helm_chart }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Checkout source repository
+        if: env.SOURCE_REPOSITORY != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_REF }}
+          path: ${{ env.SOURCE_PATH }}
+          token: ${{ secrets.SOURCE_REPO_PAT }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS namespace
+        id: namespace
+        shell: bash
+        run: |
+          ns="$AKS_NAMESPACE"
+          if [ -z "$ns" ]; then
+            ns="$ENVIRONMENT"
+          fi
+          echo "value=$ns" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve image repository
+        id: image
+        shell: bash
+        run: |
+          value="${{ inputs.image_repository || github.event.inputs.image_repository }}"
+          if [ -z "$value" ]; then
+            value="${{ secrets.ACR_LOGIN_SERVER }}/$APP_NAME"
+          fi
+          value="$(echo "$value" | tr '[:upper:]' '[:lower:]')"
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve build paths
+        id: build_paths
+        shell: bash
+        run: |
+          context="$BUILD_CONTEXT"
+          dockerfile="$DOCKERFILE_PATH"
+
+          if [ -n "$SOURCE_REPOSITORY" ]; then
+            if [ "$context" = "sample-app" ] && [ -d "$SOURCE_PATH/sample-app" ]; then
+              context="$SOURCE_PATH/sample-app"
+            fi
+            if [ "$dockerfile" = "sample-app/Dockerfile" ] && [ -f "$SOURCE_PATH/sample-app/Dockerfile" ]; then
+              dockerfile="$SOURCE_PATH/sample-app/Dockerfile"
+            fi
+          fi
+
+          if [ ! -d "$context" ]; then
+            context="."
+          fi
+
+          if [ ! -f "$dockerfile" ]; then
+            if [ -f "$context/Dockerfile" ]; then
+              dockerfile="$context/Dockerfile"
+            elif [ -f "Dockerfile" ]; then
+              dockerfile="Dockerfile"
+            else
+              dockerfile="$(find . -maxdepth 4 -type f -name Dockerfile | head -n 1)"
+              if [ -z "$dockerfile" ]; then
+                echo "No Dockerfile found."
+                echo "Repository root contents:"
+                ls -la
+                exit 1
+              fi
+              context="$(dirname "$dockerfile")"
+            fi
+          fi
+
+          echo "context=$context" >> "$GITHUB_OUTPUT"
+          echo "dockerfile=$dockerfile" >> "$GITHUB_OUTPUT"
+          echo "source_repository=${SOURCE_REPOSITORY:-local}" >> "$GITHUB_OUTPUT"
+          echo "Resolved build context: $context"
+          echo "Resolved Dockerfile: $dockerfile"
+
+      - name: Log in to ACR
+        shell: bash
+        run: |
+          az acr login --name "${{ secrets.ACR_NAME }}"
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.build_paths.outputs.context }}
+          file: ${{ steps.build_paths.outputs.dockerfile }}
+          tags: ${{ steps.image.outputs.value }}:${{ env.VERSION }}
+          push: true
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ secrets.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Capture deployment request
+        run: |
+          python scripts/deployment_ops.py deploy \
+            --app-name "$APP_NAME" \
+            --environment "$ENVIRONMENT" \
+            --image-repository "${{ steps.image.outputs.value }}" \
+            --version "$VERSION" \
+            --container-port "$CONTAINER_PORT" \
+            --release-reason "$RELEASE_REASON" \
+            --deploy-command "$DEPLOY_COMMAND" \
+            --requested-by "${{ github.actor }}"
+
+      - name: Run default deployment command
+        if: env.DEPLOY_COMMAND == ''
+        shell: bash
+        run: |
+          if [ "$USE_HELM" = "true" ]; then
+            if [ -z "$HELM_RELEASE" ] || [ -z "$HELM_CHART" ]; then
+              echo "helm_release and helm_chart are required when use_helm=true"
+              exit 1
+            fi
+            helm upgrade --install "$HELM_RELEASE" "$HELM_CHART" \
+              --namespace "${{ steps.namespace.outputs.value }}" \
+              --create-namespace \
+              --set image.repository="${{ steps.image.outputs.value }}" \
+              --set image.tag="$VERSION"
+          else
+            kubectl create namespace "${{ steps.namespace.outputs.value }}" --dry-run=client -o yaml | kubectl apply -f -
+            kubectl set image deployment/"$APP_NAME" "$APP_NAME"="${{ steps.image.outputs.value }}:$VERSION" -n "${{ steps.namespace.outputs.value }}" --record
+            kubectl rollout status deployment/"$APP_NAME" -n "${{ steps.namespace.outputs.value }}" --timeout=180s
+          fi
+
+      - name: Show deployment command summary
+        run: |
+          echo "Source repository: ${{ steps.build_paths.outputs.source_repository }}"
+          echo "docker build -f ${{ steps.build_paths.outputs.dockerfile }} -t ${{ steps.image.outputs.value }}:$VERSION ${{ steps.build_paths.outputs.context }}"
+          echo "docker push ${{ steps.image.outputs.value }}:$VERSION"
+          echo "AKS namespace: ${{ steps.namespace.outputs.value }}"
+          if [ "$USE_HELM" = "true" ]; then
+            echo "helm upgrade --install $HELM_RELEASE $HELM_CHART --namespace ${{ steps.namespace.outputs.value }} --set image.repository=${{ steps.image.outputs.value }} --set image.tag=$VERSION"
+          else
+            echo "kubectl set image deployment/$APP_NAME $APP_NAME=${{ steps.image.outputs.value }}:$VERSION -n ${{ steps.namespace.outputs.value }}"
+            echo "kubectl rollout status deployment/$APP_NAME -n ${{ steps.namespace.outputs.value }}"
+          fi
 
       - name: Run custom deploy command
         if: env.DEPLOY_COMMAND != ''

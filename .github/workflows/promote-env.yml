@@ -21,8 +21,9 @@ on:
         default: ''
         type: string
       version:
-        description: Image tag or release version
-        required: true
+        description: Image tag or release version (optional, auto-detected from source deployment if empty)
+        required: false
+        default: ''
         type: string
       promotion_notes:
         description: Additional release notes
@@ -34,15 +35,307 @@ on:
         required: false
         default: ''
         type: string
+      source_namespace:
+        description: Source Kubernetes namespace (defaults to source_env)
+        required: false
+        default: ''
+        type: string
+      target_namespace:
+        description: Target Kubernetes namespace (defaults to target_env)
+        required: false
+        default: ''
+        type: string
+      deployment_name:
+        description: Kubernetes deployment name in source and target namespaces (defaults to app_name)
+        required: false
+        default: ''
+        type: string
+      container_name:
+        description: Container name in Kubernetes deployment (defaults to app_name)
+        required: false
+        default: ''
+        type: string
+  workflow_call:
+    inputs:
+      app_name:
+        required: true
+        type: string
+      source_env:
+        required: true
+        type: string
+      target_env:
+        required: true
+        type: string
+      image_repository:
+        required: false
+        default: ''
+        type: string
+      version:
+        required: false
+        default: ''
+        type: string
+      promotion_notes:
+        required: false
+        default: ''
+        type: string
+      promote_command:
+        required: false
+        default: ''
+        type: string
+      source_namespace:
+        required: false
+        default: ''
+        type: string
+      target_namespace:
+        required: false
+        default: ''
+        type: string
+      deployment_name:
+        required: false
+        default: ''
+        type: string
+      container_name:
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  deployments: write
+  packages: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target_env || github.event.inputs.target_env }}
+    env:
+      APP_NAME: ${{ inputs.app_name || github.event.inputs.app_name }}
+      SOURCE_ENV: ${{ inputs.source_env || github.event.inputs.source_env }}
+      TARGET_ENV: ${{ inputs.target_env || github.event.inputs.target_env }}
+      VERSION: ${{ inputs.version || github.event.inputs.version }}
+      PROMOTION_NOTES: ${{ inputs.promotion_notes || github.event.inputs.promotion_notes }}
+      PROMOTE_COMMAND: ${{ inputs.promote_command || github.event.inputs.promote_command }}
+      SOURCE_NAMESPACE_INPUT: ${{ inputs.source_namespace || github.event.inputs.source_namespace }}
+      TARGET_NAMESPACE_INPUT: ${{ inputs.target_namespace || github.event.inputs.target_namespace }}
+      DEPLOYMENT_NAME_INPUT: ${{ inputs.deployment_name || github.event.inputs.deployment_name }}
+      CONTAINER_NAME_INPUT: ${{ inputs.container_name || github.event.inputs.container_name }}
+      ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+      AKS_CLUSTER_NAME: ${{ secrets.AKS_CLUSTER_NAME }}
+      AKS_RESOURCE_GROUP: ${{ secrets.AKS_RESOURCE_GROUP }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Resolve Kubernetes targets
+        id: k8s
+        shell: bash
+        run: |
+          source_namespace="$SOURCE_NAMESPACE_INPUT"
+          if [ -z "$source_namespace" ]; then
+            source_namespace="$(echo "$SOURCE_ENV" | tr '[:upper:]' '[:lower:]')"
+            if [ "$source_namespace" = "production" ]; then
+              source_namespace="prod"
+            fi
+          fi
+
+          target_namespace="$TARGET_NAMESPACE_INPUT"
+          if [ -z "$target_namespace" ]; then
+            target_namespace="$(echo "$TARGET_ENV" | tr '[:upper:]' '[:lower:]')"
+            if [ "$target_namespace" = "production" ]; then
+              target_namespace="prod"
+            fi
+          fi
+
+          deployment_name="$DEPLOYMENT_NAME_INPUT"
+          if [ -z "$deployment_name" ]; then
+            deployment_name="$APP_NAME"
+          fi
+
+          container_name="$CONTAINER_NAME_INPUT"
+          if [ -z "$container_name" ]; then
+            container_name="$APP_NAME"
+          fi
+
+          echo "source_namespace=$source_namespace" >> "$GITHUB_OUTPUT"
+          echo "target_namespace=$target_namespace" >> "$GITHUB_OUTPUT"
+          echo "deployment_name=$deployment_name" >> "$GITHUB_OUTPUT"
+          echo "container_name=$container_name" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve image repository
+        id: image
+        shell: bash
+        run: |
+          value="${{ inputs.image_repository || github.event.inputs.image_repository }}"
+          if [ -z "$value" ]; then
+            if [ -z "$ACR_LOGIN_SERVER" ]; then
+              echo "Missing required secret ACR_LOGIN_SERVER"
+              exit 1
+            fi
+            value="$ACR_LOGIN_SERVER/$APP_NAME"
+          elif [[ "$value" != */* ]]; then
+            if [ -z "$ACR_LOGIN_SERVER" ]; then
+              echo "ACR_LOGIN_SERVER secret is required when image_repository has no registry"
+              exit 1
+            fi
+            value="$ACR_LOGIN_SERVER/$value"
+          fi
+          value="$(echo "$value" | tr '[:upper:]' '[:lower:]')"
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to Azure Container Registry
+        shell: bash
+        run: |
+          if [ -z "$ACR_LOGIN_SERVER" ]; then
+            echo "Missing required secret ACR_LOGIN_SERVER"
+            exit 1
+          fi
+          az acr login --name "${ACR_LOGIN_SERVER%%.*}"
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Get AKS credentials
+        shell: bash
+        run: |
+          if [ -z "$AKS_CLUSTER_NAME" ] || [ -z "$AKS_RESOURCE_GROUP" ]; then
+            echo "Missing required AKS_CLUSTER_NAME or AKS_RESOURCE_GROUP secret"
+            exit 1
+          fi
+          az aks get-credentials --resource-group "$AKS_RESOURCE_GROUP" --name "$AKS_CLUSTER_NAME" --overwrite-existing
+
+      - name: Detect source image from source namespace
+        id: source_image
+        shell: bash
+        run: |
+          source_image="$(kubectl get deployment "${{ steps.k8s.outputs.deployment_name }}" -n "${{ steps.k8s.outputs.source_namespace }}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="${{ steps.k8s.outputs.container_name }}")].image}')"
+          if [ -z "$source_image" ]; then
+            source_image="$(kubectl get deployment "${{ steps.k8s.outputs.deployment_name }}" -n "${{ steps.k8s.outputs.source_namespace }}" -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          fi
+          if [ -z "$source_image" ]; then
+            echo "Unable to determine source image from source namespace deployment"
+            exit 1
+          fi
+
+          source_version="$VERSION"
+          if [ -z "$source_version" ]; then
+            if [[ "$source_image" == *"@"* ]]; then
+              source_version="digest"
+            else
+              source_version="${source_image##*:}"
+            fi
+          fi
+
+          echo "image=$source_image" >> "$GITHUB_OUTPUT"
+          echo "version=$source_version" >> "$GITHUB_OUTPUT"
+
+      - name: Capture promotion request
+        run: |
+          python scripts/deployment_ops.py promote \
+            --app-name "$APP_NAME" \
+            --image-repository "${{ steps.image.outputs.value }}" \
+            --source-env "$SOURCE_ENV" \
+            --target-env "$TARGET_ENV" \
+            --version "${{ steps.source_image.outputs.version }}" \
+            --promotion-notes "$PROMOTION_NOTES" \
+            --promote-command "$PROMOTE_COMMAND" \
+            --requested-by "${{ github.actor }}"
+
+      - name: Run default promotion command
+        if: env.PROMOTE_COMMAND == ''
+        shell: bash
+        run: |
+          kubectl set image deployment/${{ steps.k8s.outputs.deployment_name }} \
+            ${{ steps.k8s.outputs.container_name }}="${{ steps.source_image.outputs.image }}" \
+            -n "${{ steps.k8s.outputs.target_namespace }}"
+          kubectl rollout status deployment/${{ steps.k8s.outputs.deployment_name }} \
+            -n "${{ steps.k8s.outputs.target_namespace }}" \
+            --timeout=180s
+
+      - name: Show promotion command summary
+        run: |
+          echo "Promote image from $SOURCE_ENV to $TARGET_ENV"
+          echo "Source image: ${{ steps.source_image.outputs.image }}"
+          echo "Source namespace: ${{ steps.k8s.outputs.source_namespace }}"
+          echo "Target namespace: ${{ steps.k8s.outputs.target_namespace }}"
+          echo "kubectl set image deployment/${{ steps.k8s.outputs.deployment_name }} ${{ steps.k8s.outputs.container_name }}=${{ steps.source_image.outputs.image }} -n ${{ steps.k8s.outputs.target_namespace }}"
+          echo "kubectl rollout status deployment/${{ steps.k8s.outputs.deployment_name }} -n ${{ steps.k8s.outputs.target_namespace }} --timeout=180s"
+
+      - name: Run custom promotion command
+        if: env.PROMOTE_COMMAND != ''
+        shell: bash
+        run: |
+          eval "$PROMOTE_COMMAND"
+
+      - name: Upload promotion manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: promotion-${{ env.APP_NAME }}-${{ env.TARGET_ENV }}
+          path: deployment_state/*.json
+name: Promote to Environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: Application identifier
+        required: true
+        type: string
+      source_env:
+        description: Source environment
+        required: true
+        type: string
+      target_env:
+        description: Target environment
+        required: true
+        type: string
+      image_repository:
+        description: Container image repository
+        required: false
+        default: ''
+        type: string
+      version:
+        description: Image tag or release version
+        required: true
+        type: string
+      promotion_notes:
+        description: Additional release notes
+        required: false
+        default: ''
+        type: string
+      promote_command:
+        description: Optional custom promotion command (overrides default kubectl promotion)
+        required: false
+        default: ''
+        type: string
       target_tag:
         description: Target image tag (defaults to <version>-<target_env>)
         required: false
         default: ''
         type: string
       push_image:
-        description: Push promoted tag to repository (true/false)
+        description: Push promoted tag to repository (deprecated in AKS promotion mode)
         required: false
         default: 'false'
+        type: string
+      source_namespace:
+        description: Source Kubernetes namespace (defaults to source_env)
+        required: false
+        default: ''
+        type: string
+      target_namespace:
+        description: Target Kubernetes namespace (defaults to target_env)
+        required: false
+        default: ''
         type: string
   workflow_call:
     inputs:
@@ -78,11 +371,18 @@ on:
         required: false
         default: 'false'
         type: string
+      source_namespace:
+        required: false
+        default: ''
+        type: string
+      target_namespace:
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
   deployments: write
-  packages: write
 
 jobs:
   promote:
@@ -97,6 +397,8 @@ jobs:
       PROMOTE_COMMAND: ${{ inputs.promote_command || github.event.inputs.promote_command }}
       TARGET_TAG: ${{ inputs.target_tag || github.event.inputs.target_tag }}
       PUSH_IMAGE: ${{ inputs.push_image || github.event.inputs.push_image }}
+      SOURCE_NAMESPACE: ${{ inputs.source_namespace || github.event.inputs.source_namespace }}
+      TARGET_NAMESPACE: ${{ inputs.target_namespace || github.event.inputs.target_namespace }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -117,6 +419,21 @@ jobs:
           value="$(echo "$value" | tr '[:upper:]' '[:lower:]')"
           echo "value=$value" >> "$GITHUB_OUTPUT"
 
+      - name: Set namespaces
+        id: ns
+        shell: bash
+        run: |
+          src="$SOURCE_NAMESPACE"
+          dst="$TARGET_NAMESPACE"
+          if [ -z "$src" ]; then
+            src="$SOURCE_ENV"
+          fi
+          if [ -z "$dst" ]; then
+            dst="$TARGET_ENV"
+          fi
+          echo "source=$src" >> "$GITHUB_OUTPUT"
+          echo "target=$dst" >> "$GITHUB_OUTPUT"
+
       - name: Resolve target tag
         id: tags
         shell: bash
@@ -127,13 +444,19 @@ jobs:
           fi
           echo "target=$target" >> "$GITHUB_OUTPUT"
 
-      - name: Log in to GHCR
-        if: env.PUSH_IMAGE == 'true' && startsWith(steps.image.outputs.value, 'ghcr.io/')
-        uses: docker/login-action@v3
+      - name: Azure login
+        uses: azure/login@v2
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ secrets.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
 
       - name: Capture promotion request
         run: |
@@ -151,19 +474,25 @@ jobs:
         if: env.PROMOTE_COMMAND == ''
         shell: bash
         run: |
-          docker pull "${{ steps.image.outputs.value }}:$VERSION"
-          docker tag "${{ steps.image.outputs.value }}:$VERSION" "${{ steps.image.outputs.value }}:${{ steps.tags.outputs.target }}"
-          if [ "$PUSH_IMAGE" = "true" ]; then
-            docker push "${{ steps.image.outputs.value }}:${{ steps.tags.outputs.target }}"
+          src_image=$(kubectl get deployment "$APP_NAME" -n "${{ steps.ns.outputs.source }}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"$APP_NAME"'")].image}')
+          if [ -z "$src_image" ]; then
+            src_image=$(kubectl get deployment "$APP_NAME" -n "${{ steps.ns.outputs.source }}" -o jsonpath='{.spec.template.spec.containers[0].image}')
           fi
+          if [ -z "$src_image" ]; then
+            echo "Could not resolve source image from deployment/$APP_NAME in namespace ${{ steps.ns.outputs.source }}"
+            exit 1
+          fi
+          kubectl create namespace "${{ steps.ns.outputs.target }}" --dry-run=client -o yaml | kubectl apply -f -
+          kubectl set image deployment/"$APP_NAME" "$APP_NAME"="$src_image" -n "${{ steps.ns.outputs.target }}" --record
+          kubectl rollout status deployment/"$APP_NAME" -n "${{ steps.ns.outputs.target }}" --timeout=180s
+          echo "source_image=$src_image" >> "$GITHUB_OUTPUT"
 
       - name: Show promotion command summary
         run: |
-          echo "Promote image ${{ steps.image.outputs.value }}:$VERSION from $SOURCE_ENV to $TARGET_ENV"
-          echo "Promoted target tag: ${{ steps.tags.outputs.target }}"
-          echo "docker pull ${{ steps.image.outputs.value }}:$VERSION"
-          echo "docker tag ${{ steps.image.outputs.value }}:$VERSION ${{ steps.image.outputs.value }}:${{ steps.tags.outputs.target }}"
-          echo "docker push ${{ steps.image.outputs.value }}:${{ steps.tags.outputs.target }} (if push_image=true)"
+          echo "Promote deployment $APP_NAME from namespace ${{ steps.ns.outputs.source }} to ${{ steps.ns.outputs.target }}"
+          echo "Source image used: ${{ steps.image.outputs.value }}:$VERSION (or discovered from source deployment)"
+          echo "kubectl set image deployment/$APP_NAME $APP_NAME=<source-image> -n ${{ steps.ns.outputs.target }}"
+          echo "kubectl rollout status deployment/$APP_NAME -n ${{ steps.ns.outputs.target }}"
 
       - name: Run custom promotion command
         if: env.PROMOTE_COMMAND != ''
