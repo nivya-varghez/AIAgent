@@ -1,0 +1,192 @@
+name: Deploy Application
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: Application identifier
+        required: true
+        type: string
+      environment:
+        description: Target environment
+        required: true
+        type: string
+      image_repository:
+        description: Container image repository
+        required: false
+        default: ''
+        type: string
+      version:
+        description: Image tag or release version
+        required: true
+        default: latest
+        type: string
+      container_port:
+        description: Application container port
+        required: true
+        default: '8080'
+        type: string
+      reason:
+        description: Deployment reason
+        required: false
+        default: ''
+        type: string
+      deploy_command:
+        description: Optional custom deployment command
+        required: false
+        default: ''
+        type: string
+      build_context:
+        description: Docker build context path
+        required: false
+        default: sample-app
+        type: string
+      dockerfile_path:
+        description: Dockerfile path
+        required: false
+        default: sample-app/Dockerfile
+        type: string
+      push_image:
+        description: Push image to repository (true/false)
+        required: false
+        default: 'false'
+        type: string
+  workflow_call:
+    inputs:
+      app_name:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      image_repository:
+        required: false
+        default: ''
+        type: string
+      version:
+        required: true
+        type: string
+      container_port:
+        required: false
+        default: '8080'
+        type: string
+      reason:
+        required: false
+        default: ''
+        type: string
+      deploy_command:
+        required: false
+        default: ''
+        type: string
+      build_context:
+        required: false
+        default: sample-app
+        type: string
+      dockerfile_path:
+        required: false
+        default: sample-app/Dockerfile
+        type: string
+      push_image:
+        required: false
+        default: 'false'
+        type: string
+
+permissions:
+  contents: read
+  deployments: write
+  packages: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || github.event.inputs.environment }}
+    env:
+      APP_NAME: ${{ inputs.app_name || github.event.inputs.app_name }}
+      ENVIRONMENT: ${{ inputs.environment || github.event.inputs.environment }}
+      VERSION: ${{ inputs.version || github.event.inputs.version }}
+      CONTAINER_PORT: ${{ inputs.container_port || github.event.inputs.container_port }}
+      RELEASE_REASON: ${{ inputs.reason || github.event.inputs.reason }}
+      DEPLOY_COMMAND: ${{ inputs.deploy_command || github.event.inputs.deploy_command }}
+      BUILD_CONTEXT: ${{ inputs.build_context || github.event.inputs.build_context }}
+      DOCKERFILE_PATH: ${{ inputs.dockerfile_path || github.event.inputs.dockerfile_path }}
+      PUSH_IMAGE: ${{ inputs.push_image || github.event.inputs.push_image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Resolve image repository
+        id: image
+        shell: bash
+        run: |
+          value="${{ inputs.image_repository || github.event.inputs.image_repository }}"
+          if [ -z "$value" ]; then
+            value="ghcr.io/${{ github.repository_owner }}/$APP_NAME"
+          fi
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: env.PUSH_IMAGE == 'true' && startsWith(steps.image.outputs.value, 'ghcr.io/')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.BUILD_CONTEXT }}
+          file: ${{ env.DOCKERFILE_PATH }}
+          tags: ${{ steps.image.outputs.value }}:${{ env.VERSION }}
+          push: ${{ env.PUSH_IMAGE == 'true' }}
+          load: ${{ env.PUSH_IMAGE != 'true' }}
+
+      - name: Capture deployment request
+        run: |
+          python scripts/deployment_ops.py deploy \
+            --app-name "$APP_NAME" \
+            --environment "$ENVIRONMENT" \
+            --image-repository "${{ steps.image.outputs.value }}" \
+            --version "$VERSION" \
+            --container-port "$CONTAINER_PORT" \
+            --release-reason "$RELEASE_REASON" \
+            --deploy-command "$DEPLOY_COMMAND" \
+            --requested-by "${{ github.actor }}"
+
+      - name: Run default deployment command
+        if: env.DEPLOY_COMMAND == ''
+        shell: bash
+        run: |
+          if [ "$PUSH_IMAGE" = "true" ]; then
+            docker pull "${{ steps.image.outputs.value }}:$VERSION"
+          fi
+          docker rm -f "$APP_NAME" >/dev/null 2>&1 || true
+          docker run -d --name "$APP_NAME" -p "$CONTAINER_PORT:$CONTAINER_PORT" "${{ steps.image.outputs.value }}:$VERSION"
+          docker ps --filter "name=$APP_NAME"
+
+      - name: Show deployment command summary
+        run: |
+          echo "docker build -f $DOCKERFILE_PATH -t ${{ steps.image.outputs.value }}:$VERSION $BUILD_CONTEXT"
+          echo "docker push ${{ steps.image.outputs.value }}:$VERSION (if push_image=true)"
+          echo "docker pull ${{ steps.image.outputs.value }}:$VERSION"
+          echo "docker run -d --name $APP_NAME -p $CONTAINER_PORT:$CONTAINER_PORT ${{ steps.image.outputs.value }}:$VERSION"
+
+      - name: Run custom deploy command
+        if: env.DEPLOY_COMMAND != ''
+        shell: bash
+        run: |
+          eval "$DEPLOY_COMMAND"
+
+      - name: Upload deployment manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}
+          path: deployment_state/*.json

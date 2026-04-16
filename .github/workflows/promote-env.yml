@@ -1,0 +1,177 @@
+name: Promote to Environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: Application identifier
+        required: true
+        type: string
+      source_env:
+        description: Source environment
+        required: true
+        type: string
+      target_env:
+        description: Target environment
+        required: true
+        type: string
+      image_repository:
+        description: Container image repository
+        required: false
+        default: ''
+        type: string
+      version:
+        description: Image tag or release version
+        required: true
+        type: string
+      promotion_notes:
+        description: Additional release notes
+        required: false
+        default: ''
+        type: string
+      promote_command:
+        description: Optional custom promotion command
+        required: false
+        default: ''
+        type: string
+      target_tag:
+        description: Target image tag (defaults to <version>-<target_env>)
+        required: false
+        default: ''
+        type: string
+      push_image:
+        description: Push promoted tag to repository (true/false)
+        required: false
+        default: 'false'
+        type: string
+  workflow_call:
+    inputs:
+      app_name:
+        required: true
+        type: string
+      source_env:
+        required: true
+        type: string
+      target_env:
+        required: true
+        type: string
+      image_repository:
+        required: false
+        default: ''
+        type: string
+      version:
+        required: true
+        type: string
+      promotion_notes:
+        required: false
+        default: ''
+        type: string
+      promote_command:
+        required: false
+        default: ''
+        type: string
+      target_tag:
+        required: false
+        default: ''
+        type: string
+      push_image:
+        required: false
+        default: 'false'
+        type: string
+
+permissions:
+  contents: read
+  deployments: write
+  packages: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target_env || github.event.inputs.target_env }}
+    env:
+      APP_NAME: ${{ inputs.app_name || github.event.inputs.app_name }}
+      SOURCE_ENV: ${{ inputs.source_env || github.event.inputs.source_env }}
+      TARGET_ENV: ${{ inputs.target_env || github.event.inputs.target_env }}
+      VERSION: ${{ inputs.version || github.event.inputs.version }}
+      PROMOTION_NOTES: ${{ inputs.promotion_notes || github.event.inputs.promotion_notes }}
+      PROMOTE_COMMAND: ${{ inputs.promote_command || github.event.inputs.promote_command }}
+      TARGET_TAG: ${{ inputs.target_tag || github.event.inputs.target_tag }}
+      PUSH_IMAGE: ${{ inputs.push_image || github.event.inputs.push_image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Resolve image repository
+        id: image
+        shell: bash
+        run: |
+          value="${{ inputs.image_repository || github.event.inputs.image_repository }}"
+          if [ -z "$value" ]; then
+            value="ghcr.io/${{ github.repository_owner }}/$APP_NAME"
+          fi
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve target tag
+        id: tags
+        shell: bash
+        run: |
+          target="$TARGET_TAG"
+          if [ -z "$target" ]; then
+            target="$VERSION-$TARGET_ENV"
+          fi
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: env.PUSH_IMAGE == 'true' && startsWith(steps.image.outputs.value, 'ghcr.io/')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Capture promotion request
+        run: |
+          python scripts/deployment_ops.py promote \
+            --app-name "$APP_NAME" \
+            --image-repository "${{ steps.image.outputs.value }}" \
+            --source-env "$SOURCE_ENV" \
+            --target-env "$TARGET_ENV" \
+            --version "$VERSION" \
+            --promotion-notes "$PROMOTION_NOTES" \
+            --promote-command "$PROMOTE_COMMAND" \
+            --requested-by "${{ github.actor }}"
+
+      - name: Run default promotion command
+        if: env.PROMOTE_COMMAND == ''
+        shell: bash
+        run: |
+          docker pull "${{ steps.image.outputs.value }}:$VERSION"
+          docker tag "${{ steps.image.outputs.value }}:$VERSION" "${{ steps.image.outputs.value }}:${{ steps.tags.outputs.target }}"
+          if [ "$PUSH_IMAGE" = "true" ]; then
+            docker push "${{ steps.image.outputs.value }}:${{ steps.tags.outputs.target }}"
+          fi
+
+      - name: Show promotion command summary
+        run: |
+          echo "Promote image ${{ steps.image.outputs.value }}:$VERSION from $SOURCE_ENV to $TARGET_ENV"
+          echo "Promoted target tag: ${{ steps.tags.outputs.target }}"
+          echo "docker pull ${{ steps.image.outputs.value }}:$VERSION"
+          echo "docker tag ${{ steps.image.outputs.value }}:$VERSION ${{ steps.image.outputs.value }}:${{ steps.tags.outputs.target }}"
+          echo "docker push ${{ steps.image.outputs.value }}:${{ steps.tags.outputs.target }} (if push_image=true)"
+
+      - name: Run custom promotion command
+        if: env.PROMOTE_COMMAND != ''
+        shell: bash
+        run: |
+          eval "$PROMOTE_COMMAND"
+
+      - name: Upload promotion manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: promotion-${{ env.APP_NAME }}-${{ env.TARGET_ENV }}
+          path: deployment_state/*.json

@@ -1,0 +1,136 @@
+name: Rollback Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: Application identifier
+        required: true
+        type: string
+      environment:
+        description: Target environment
+        required: true
+        type: string
+      image_repository:
+        description: Container image repository
+        required: false
+        default: ''
+        type: string
+      previous_version:
+        description: Version to restore
+        required: true
+        type: string
+      incident_reference:
+        description: Incident or change reference
+        required: false
+        default: ''
+        type: string
+      rollback_command:
+        description: Optional custom rollback command
+        required: false
+        default: ''
+        type: string
+      container_port:
+        description: Application container port
+        required: false
+        default: '8080'
+        type: string
+  workflow_call:
+    inputs:
+      app_name:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      image_repository:
+        required: false
+        default: ''
+        type: string
+      previous_version:
+        required: true
+        type: string
+      incident_reference:
+        required: false
+        default: ''
+        type: string
+      rollback_command:
+        required: false
+        default: ''
+        type: string
+      container_port:
+        required: false
+        default: '8080'
+        type: string
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || github.event.inputs.environment }}
+    env:
+      APP_NAME: ${{ inputs.app_name || github.event.inputs.app_name }}
+      ENVIRONMENT: ${{ inputs.environment || github.event.inputs.environment }}
+      PREVIOUS_VERSION: ${{ inputs.previous_version || github.event.inputs.previous_version }}
+      INCIDENT_REFERENCE: ${{ inputs.incident_reference || github.event.inputs.incident_reference }}
+      ROLLBACK_COMMAND: ${{ inputs.rollback_command || github.event.inputs.rollback_command }}
+      CONTAINER_PORT: ${{ inputs.container_port || github.event.inputs.container_port }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Resolve image repository
+        id: image
+        shell: bash
+        run: |
+          value="${{ inputs.image_repository || github.event.inputs.image_repository }}"
+          if [ -z "$value" ]; then
+            value="ghcr.io/${{ github.repository_owner }}/$APP_NAME"
+          fi
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+
+      - name: Capture rollback request
+        run: |
+          python scripts/deployment_ops.py rollback \
+            --app-name "$APP_NAME" \
+            --environment "$ENVIRONMENT" \
+            --image-repository "${{ steps.image.outputs.value }}" \
+            --previous-version "$PREVIOUS_VERSION" \
+            --incident-reference "$INCIDENT_REFERENCE" \
+            --rollback-command "$ROLLBACK_COMMAND" \
+            --requested-by "${{ github.actor }}"
+
+      - name: Run default rollback command
+        if: env.ROLLBACK_COMMAND == ''
+        shell: bash
+        run: |
+          docker pull "${{ steps.image.outputs.value }}:$PREVIOUS_VERSION"
+          docker rm -f "$APP_NAME" >/dev/null 2>&1 || true
+          docker run -d --name "$APP_NAME" -p "$CONTAINER_PORT:$CONTAINER_PORT" "${{ steps.image.outputs.value }}:$PREVIOUS_VERSION"
+          docker ps --filter "name=$APP_NAME"
+
+      - name: Show rollback command summary
+        run: |
+          echo "Rollback ${{ steps.image.outputs.value }} in $ENVIRONMENT to $PREVIOUS_VERSION"
+          echo "docker pull ${{ steps.image.outputs.value }}:$PREVIOUS_VERSION"
+          echo "docker run -d --name $APP_NAME -p $CONTAINER_PORT:$CONTAINER_PORT ${{ steps.image.outputs.value }}:$PREVIOUS_VERSION"
+
+      - name: Run custom rollback command
+        if: env.ROLLBACK_COMMAND != ''
+        shell: bash
+        run: |
+          eval "$ROLLBACK_COMMAND"
+
+      - name: Upload rollback manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}
+          path: deployment_state/*.json
