@@ -46,11 +46,6 @@ on:
         required: false
         default: sample-app/Dockerfile
         type: string
-      push_image:
-        description: Push image to repository (kept for compatibility, ignored)
-        required: false
-        default: 'true'
-        type: string
       k8s_namespace:
         description: Kubernetes namespace (defaults to environment)
         required: false
@@ -115,10 +110,6 @@ on:
       dockerfile_path:
         required: false
         default: sample-app/Dockerfile
-        type: string
-      push_image:
-        required: false
-        default: 'true'
         type: string
       k8s_namespace:
         required: false

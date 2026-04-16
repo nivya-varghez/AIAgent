@@ -36,11 +36,6 @@ on:
         required: false
         default: undo
         type: string
-      container_port:
-        description: Application container port (kept for compatibility)
-        required: false
-        default: '8080'
-        type: string
       k8s_namespace:
         description: Kubernetes namespace (defaults to environment)
         required: false
@@ -83,10 +78,6 @@ on:
       rollback_mode:
         required: false
         default: undo
-        type: string
-      container_port:
-        required: false
-        default: '8080'
         type: string
       k8s_namespace:
         required: false
