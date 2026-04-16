@@ -51,6 +51,21 @@ on:
         required: false
         default: 'false'
         type: string
+      source_repository:
+        description: Optional source repo containing Dockerfile/app (owner/repo)
+        required: false
+        default: ''
+        type: string
+      source_ref:
+        description: Branch or tag for source repository checkout
+        required: false
+        default: main
+        type: string
+      source_path:
+        description: Checkout folder name for source repository
+        required: false
+        default: app-source
+        type: string
   workflow_call:
     inputs:
       app_name:
@@ -90,6 +105,18 @@ on:
         required: false
         default: 'false'
         type: string
+      source_repository:
+        required: false
+        default: ''
+        type: string
+      source_ref:
+        required: false
+        default: main
+        type: string
+      source_path:
+        required: false
+        default: app-source
+        type: string
 
 permissions:
   contents: read
@@ -110,9 +137,21 @@ jobs:
       BUILD_CONTEXT: ${{ inputs.build_context || github.event.inputs.build_context }}
       DOCKERFILE_PATH: ${{ inputs.dockerfile_path || github.event.inputs.dockerfile_path }}
       PUSH_IMAGE: ${{ inputs.push_image || github.event.inputs.push_image }}
+      SOURCE_REPOSITORY: ${{ inputs.source_repository || github.event.inputs.source_repository }}
+      SOURCE_REF: ${{ inputs.source_ref || github.event.inputs.source_ref }}
+      SOURCE_PATH: ${{ inputs.source_path || github.event.inputs.source_path }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Checkout source repository
+        if: env.SOURCE_REPOSITORY != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_REF }}
+          path: ${{ env.SOURCE_PATH }}
+          token: ${{ secrets.SOURCE_REPO_PAT }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -140,6 +179,15 @@ jobs:
           context="$BUILD_CONTEXT"
           dockerfile="$DOCKERFILE_PATH"
 
+          if [ -n "$SOURCE_REPOSITORY" ]; then
+            if [ "$context" = "sample-app" ] && [ -d "$SOURCE_PATH/sample-app" ]; then
+              context="$SOURCE_PATH/sample-app"
+            fi
+            if [ "$dockerfile" = "sample-app/Dockerfile" ] && [ -f "$SOURCE_PATH/sample-app/Dockerfile" ]; then
+              dockerfile="$SOURCE_PATH/sample-app/Dockerfile"
+            fi
+          fi
+
           if [ ! -d "$context" ]; then
             context="."
           fi
@@ -163,6 +211,7 @@ jobs:
 
           echo "context=$context" >> "$GITHUB_OUTPUT"
           echo "dockerfile=$dockerfile" >> "$GITHUB_OUTPUT"
+          echo "source_repository=${SOURCE_REPOSITORY:-local}" >> "$GITHUB_OUTPUT"
           echo "Resolved build context: $context"
           echo "Resolved Dockerfile: $dockerfile"
 
@@ -208,6 +257,7 @@ jobs:
 
       - name: Show deployment command summary
         run: |
+          echo "Source repository: ${{ steps.build_paths.outputs.source_repository }}"
           echo "docker build -f ${{ steps.build_paths.outputs.dockerfile }} -t ${{ steps.image.outputs.value }}:$VERSION ${{ steps.build_paths.outputs.context }}"
           echo "docker push ${{ steps.image.outputs.value }}:$VERSION (if push_image=true)"
           echo "docker pull ${{ steps.image.outputs.value }}:$VERSION"
