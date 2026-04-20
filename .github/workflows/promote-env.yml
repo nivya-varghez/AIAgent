@@ -56,6 +56,16 @@ on:
         required: false
         default: ''
         type: string
+      emergency:
+        description: Emergency promotion flag (true for dev->prod emergency path only)
+        required: false
+        default: 'false'
+        type: string
+      emergency_reason:
+        description: Incident/ticket reference for emergency promotions
+        required: false
+        default: ''
+        type: string
   workflow_call:
     inputs:
       app_name:
@@ -99,6 +109,14 @@ on:
         required: false
         default: ''
         type: string
+      emergency:
+        required: false
+        default: 'false'
+        type: string
+      emergency_reason:
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -108,7 +126,7 @@ permissions:
 jobs:
   promote:
     runs-on: ubuntu-latest
-    environment: ${{ inputs.target_env || github.event.inputs.target_env }}
+    environment: ${{ (inputs.emergency || github.event.inputs.emergency) == 'true' && (inputs.source_env || github.event.inputs.source_env) == 'dev' && (inputs.target_env || github.event.inputs.target_env) == 'prod' && 'prod-emergency' || (inputs.target_env || github.event.inputs.target_env) }}
     env:
       APP_NAME: ${{ inputs.app_name || github.event.inputs.app_name }}
       SOURCE_ENV: ${{ inputs.source_env || github.event.inputs.source_env }}
@@ -120,10 +138,56 @@ jobs:
       TARGET_NAMESPACE_INPUT: ${{ inputs.target_namespace || github.event.inputs.target_namespace }}
       DEPLOYMENT_NAME_INPUT: ${{ inputs.deployment_name || github.event.inputs.deployment_name }}
       CONTAINER_NAME_INPUT: ${{ inputs.container_name || github.event.inputs.container_name }}
+      EMERGENCY: ${{ inputs.emergency || github.event.inputs.emergency }}
+      EMERGENCY_REASON: ${{ inputs.emergency_reason || github.event.inputs.emergency_reason }}
       ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
       AKS_CLUSTER_NAME: ${{ secrets.AKS_CLUSTER_NAME }}
       AKS_RESOURCE_GROUP: ${{ secrets.AKS_RESOURCE_GROUP }}
     steps:
+      - name: Validate promotion path against policy
+        shell: bash
+        run: |
+          source_env="$(echo "$SOURCE_ENV" | tr '[:upper:]' '[:lower:]')"
+          target_env="$(echo "$TARGET_ENV" | tr '[:upper:]' '[:lower:]')"
+          emergency="$(echo "$EMERGENCY" | tr '[:upper:]' '[:lower:]')"
+          
+          # Rule 1: No promotions TO dev
+          if [ "$target_env" = "dev" ]; then
+            echo "❌ ERROR: Promotion to 'dev' is not allowed. Dev is a source environment only."
+            exit 1
+          fi
+          
+          # Rule 2: dev -> stage
+          if [ "$source_env" = "dev" ] && [ "$target_env" = "staging" ]; then
+            echo "✅ Valid path: dev -> staging"
+            exit 0
+          fi
+          
+          # Rule 3: stage -> prod
+          if [ "$source_env" = "staging" ] && [ "$target_env" = "prod" ]; then
+            echo "✅ Valid path: staging -> prod"
+            exit 0
+          fi
+          
+          # Rule 4: dev -> prod (emergency only)
+          if [ "$source_env" = "dev" ] && [ "$target_env" = "prod" ]; then
+            if [ "$emergency" != "true" ]; then
+              echo "❌ ERROR: Direct promotion from 'dev' to 'prod' requires emergency flag. Cannot proceed."
+              exit 1
+            fi
+            if [ -z "$EMERGENCY_REASON" ]; then
+              echo "❌ ERROR: Emergency promotion from 'dev' to 'prod' requires incident/ticket reference. Cannot proceed."
+              exit 1
+            fi
+            echo "✅ Valid path: dev -> prod (EMERGENCY) - Incident: $EMERGENCY_REASON"
+            exit 0
+          fi
+          
+          # Rule 5: All other paths rejected
+          echo "❌ ERROR: Promotion path not allowed: $source_env -> $target_env"
+          echo "   Allowed paths: dev->staging, staging->prod, or dev->prod (emergency only)"
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@v4
 

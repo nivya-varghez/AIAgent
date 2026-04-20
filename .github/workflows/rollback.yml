@@ -75,6 +75,22 @@ jobs:
       AKS_CLUSTER_NAME: ${{ secrets.AKS_CLUSTER_NAME }}
       AKS_RESOURCE_GROUP: ${{ secrets.AKS_RESOURCE_GROUP }}
     steps:
+      - name: Validate rollback configuration
+        shell: bash
+        run: |
+          environment="$(echo "$ENVIRONMENT" | tr '[:upper:]' '[:lower:]')"
+          
+          # Rollback is ALWAYS same-environment to previous version in that environment
+          # No cross-environment rollback (e.g., cannot rollback from prod to staging)
+          if [ -z "$environment" ]; then
+            echo "❌ ERROR: Environment is required for rollback."
+            exit 1
+          fi
+          
+          echo "✅ Rollback in environment: $environment"
+          echo "   Rollback mode: $ROLLBACK_MODE (undo=previous revision, set_image=explicit version)"
+          echo "   Target: Previous version in the SAME environment ($environment)"
+
       - name: Checkout
         uses: actions/checkout@v4
 
