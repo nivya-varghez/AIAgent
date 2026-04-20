@@ -216,6 +216,22 @@ jobs:
           echo "Resolved build context: $context"
           echo "Resolved Dockerfile: $dockerfile"
 
+      - name: Compute build content hash
+        id: build_hash
+        shell: bash
+        run: |
+          context="${{ steps.build_paths.outputs.context }}"
+          dockerfile="${{ steps.build_paths.outputs.dockerfile }}"
+
+          # Hash Dockerfile plus all build-context files in a stable order.
+          context_hash="$({
+            sha256sum "$dockerfile"
+            find "$context" -type f -print0 | sort -z | xargs -0 sha256sum
+          } | sha256sum | cut -c1-12)"
+
+          echo "value=$context_hash" >> "$GITHUB_OUTPUT"
+          echo "Computed build content hash: $context_hash"
+
       - name: Azure login
         uses: azure/login@v2
         with:
@@ -230,6 +246,27 @@ jobs:
           fi
           az acr login --name "${ACR_LOGIN_SERVER%%.*}"
 
+      - name: Check if image tag already exists in ACR
+        id: image_exists
+        shell: bash
+        run: |
+          image_repo="${{ steps.image.outputs.value }}"
+          repo_path="${image_repo#*/}"
+          acr_name="${ACR_LOGIN_SERVER%%.*}"
+          hash_tag="$VERSION-${{ steps.build_hash.outputs.value }}"
+
+          if az acr repository show-tags \
+            --name "$acr_name" \
+            --repository "$repo_path" \
+            --query "contains(@, '$hash_tag')" \
+            -o tsv | grep -qi "true"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Image already exists for current content: $image_repo:$hash_tag"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Image does not exist for current content: $image_repo:$hash_tag"
+          fi
+
       - name: Set up kubectl
         uses: azure/setup-kubectl@v4
 
@@ -243,13 +280,21 @@ jobs:
           az aks get-credentials --resource-group "$AKS_RESOURCE_GROUP" --name "$AKS_CLUSTER_NAME" --overwrite-existing
 
       - name: Build and push image to ACR
+        if: steps.image_exists.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
           context: ${{ steps.build_paths.outputs.context }}
           file: ${{ steps.build_paths.outputs.dockerfile }}
-          tags: ${{ steps.image.outputs.value }}:${{ env.VERSION }}
+          tags: |
+            ${{ steps.image.outputs.value }}:${{ env.VERSION }}
+            ${{ steps.image.outputs.value }}:${{ env.VERSION }}-${{ steps.build_hash.outputs.value }}
           push: true
           load: false
+
+      - name: Skip image build (already exists)
+        if: steps.image_exists.outputs.exists == 'true'
+        shell: bash
+        run: echo "Skipping build/push because unchanged content image already exists in ACR."
 
       - name: Capture deployment request
         run: |
@@ -278,8 +323,10 @@ jobs:
       - name: Show deployment command summary
         run: |
           echo "Source repository: ${{ steps.build_paths.outputs.source_repository }}"
+          echo "Build content hash: ${{ steps.build_hash.outputs.value }}"
           echo "docker build -f ${{ steps.build_paths.outputs.dockerfile }} -t ${{ steps.image.outputs.value }}:$VERSION ${{ steps.build_paths.outputs.context }}"
           echo "docker push ${{ steps.image.outputs.value }}:$VERSION"
+          echo "docker push ${{ steps.image.outputs.value }}:$VERSION-${{ steps.build_hash.outputs.value }}"
           echo "kubectl set image deployment/${{ steps.k8s.outputs.deployment_name }} ${{ steps.k8s.outputs.container_name }}=${{ steps.image.outputs.value }}:$VERSION -n ${{ steps.k8s.outputs.namespace }}"
           echo "kubectl rollout status deployment/${{ steps.k8s.outputs.deployment_name }} -n ${{ steps.k8s.outputs.namespace }} --timeout=180s"
 
